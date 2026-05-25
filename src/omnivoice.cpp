@@ -10,6 +10,9 @@
 
 #include "omnivoice.h"
 
+#include <cmath>
+
+#include "audio-postproc.h"
 #include "backend.h"
 #include "bpe.h"
 #include "ov-error.h"
@@ -198,6 +201,7 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->ref_audio_24k           = nullptr;
     p->ref_n_samples           = 0;
     p->ref_text                = nullptr;
+    p->ref_rms                 = -1.0f;
     p->dump_dir                = nullptr;
     p->cancel                  = nullptr;
     p->cancel_user_data        = nullptr;
@@ -335,6 +339,70 @@ int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec) 
         return 1;
     }
     return pipeline_tts_duration_sec_to_tokens(&ov->pc, duration_sec);
+}
+
+void ov_codes_free(struct ov_codes * c) {
+    if (c) {
+        free(c->data);
+        c->data = NULL;
+        c->K    = 0;
+        c->T    = 0;
+    }
+}
+
+enum ov_status ov_encode_reference(struct ov_context * ov, const float * audio_24k, int n_samples,
+                                   struct ov_codes * out) {
+    if (!ov || !out) {
+        ov_set_error("ov_encode_reference: ov or out is NULL");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!ov->codec_loaded) {
+        ov_set_error("ov_encode_reference: codec not loaded");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!audio_24k || n_samples <= 0) {
+        ov_set_error("ov_encode_reference: audio_24k is NULL or n_samples <= 0");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+
+    try {
+        std::vector<float> audio(audio_24k, audio_24k + n_samples);
+
+        // RMS loudness normalization (mirrors tts_encode_ref in pipeline-tts.cpp)
+        double sumsq = 0.0;
+        for (float v : audio) sumsq += (double)v * (double)v;
+        double rms = std::sqrt(sumsq / (double)audio.size());
+        out->ref_rms = (float) rms;
+
+        if (rms > 0.0 && rms < 0.1) {
+            float gain = (float)(0.1 / rms);
+            for (float & v : audio) v *= gain;
+        }
+
+        // Silence trimming (mirrors tts_encode_ref with preprocess_prompt=true)
+        remove_silence(audio, 24000, 200, 100, 200, -50.0);
+
+        // Align to hop_length (mirrors tts_encode_ref in pipeline-tts.cpp)
+        int n_aligned = ((int)audio.size() / ov->pc.hop_length) * ov->pc.hop_length;
+
+        std::vector<int32_t> codes = pipeline_codec_encode(&ov->pc, audio.data(), n_aligned, NULL);
+        if (codes.empty()) {
+            ov_set_error("ov_encode_reference: pipeline_codec_encode returned empty codes");
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        out->K    = ov->pc.rvq.num_codebooks;
+        out->T    = (int) codes.size() / out->K;
+        out->data = (int32_t *) malloc(codes.size() * sizeof(int32_t));
+        if (!out->data) {
+            ov_set_error("ov_encode_reference: malloc failed");
+            return OV_STATUS_OOM;
+        }
+        memcpy(out->data, codes.data(), codes.size() * sizeof(int32_t));
+        return OV_STATUS_OK;
+    } catch (const std::exception & e) {
+        ov_set_error("ov_encode_reference: %s", e.what());
+        return OV_STATUS_GENERATE_FAILED;
+    }
 }
 
 }  // extern "C"

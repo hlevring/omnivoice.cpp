@@ -222,6 +222,7 @@ struct ov_tts_params {
     const float *   ref_audio_24k;
     int             ref_n_samples;
     const char *    ref_text;
+    float           ref_rms;    // when using ref_audio_tokens: original RMS from ov_encode_reference. -1 = peak/0.5 fallback
 
     // Intermediate tensor dump directory. NULL disables dumps.
     const char * dump_dir;
@@ -256,6 +257,31 @@ OV_API enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_
 // frame rate (sample_rate / hop_length). Clamps to a minimum of one
 // frame. Requires a codec-loaded handle.
 OV_API int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec);
+
+// RVQ codes extracted from reference audio. Layout is [K, T] row-major
+// (K codebooks, T frames). The data pointer is malloc allocated by
+// ov_encode_reference, owned by the struct, released by ov_codes_free.
+// Zero initialise before first use: `struct ov_codes c = {0};`.
+struct ov_codes {
+    int32_t * data;   // malloc allocated [K * T] row-major
+    int       K;      // number of codebooks (8)
+    int       T;      // number of frames
+    float     ref_rms; // original RMS before normalization; pass to ov_tts_params.ref_rms for loudness-matched post-proc
+};
+
+// Release the codes buffer and reset the struct to empty. Safe on a
+// zero initialised struct.
+OV_API void ov_codes_free(struct ov_codes * c);
+
+// Encode a mono 24 kHz audio buffer into RVQ codes using the loaded
+// codec. The resulting codes can be reused across multiple ov_synthesize
+// calls via params.ref_audio_tokens / params.ref_T without re-running
+// the encoder. Requires a codec-loaded handle.
+OV_API enum ov_status ov_encode_reference(
+    struct ov_context * ov,
+    const float *       audio_24k,
+    int                 n_samples,
+    struct ov_codes *   out);
 
 #ifdef __cplusplus
 }
