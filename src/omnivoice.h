@@ -193,7 +193,10 @@ struct ov_tts_params {
     // frame count and bypasses both the estimator and the chunker.
     // T_override == 0 lets the pipeline decide between single-shot and
     // chunked output. chunk_duration_sec <= 0 disables chunking entirely.
+    // speed scales the estimated frame count: >1.0 faster, <1.0 slower,
+    // 1.0 neutral. Ignored when T_override > 0.
     int   T_override;
+    float speed;
     float chunk_duration_sec;
     float chunk_threshold_sec;
 
@@ -240,7 +243,7 @@ struct ov_tts_params {
 };
 
 // Initialise to the standard defaults. Strings NULL, T_override 0,
-// chunk_duration_sec 15, chunk_threshold_sec 30, denoise true,
+// speed 1.0, chunk_duration_sec 15, chunk_threshold_sec 30, denoise true,
 // preprocess_prompt true, MaskGIT defaults as above, every reference
 // pointer NULL, dump_dir NULL, cancel NULL.
 OV_API void ov_tts_default_params(struct ov_tts_params * p);
