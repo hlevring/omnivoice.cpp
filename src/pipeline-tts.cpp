@@ -835,6 +835,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                                                        const std::string &   lang,
                                                        const std::string &   instruct,
                                                        int                   T_override,
+                                                       float                 speed,
                                                        float                 chunk_duration_sec,
                                                        float                 chunk_threshold_sec,
                                                        bool                  denoise,
@@ -856,6 +857,11 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
     // Estimated tokens for the full text. Chunking trigger uses the same
     // estimator as the single-shot path for consistency with upstream.
     int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T);
+
+    if (T_override <= 0 && speed > 0.0f && speed != 1.0f) {
+        T_total = std::max(1, (int) ((float) T_total / speed));
+        ov_log(OV_LOG_INFO, "[TTS] Speed %.2f -> T_total scaled to %d frames", speed, T_total);
+    }
 
     int  threshold_frames = (int) (chunk_threshold_sec * (float) frame_rate);
     bool no_chunk         = (T_override > 0) || (chunk_duration_sec <= 0.0f) || (T_total <= threshold_frames);
@@ -928,6 +934,9 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
             const std::string & this_ref_text = first_no_ref ? std::string() : prompt_text;
 
             int Ti = duration_estimate_tokens(ct, this_ref_text, this_T);
+            if (T_override <= 0 && speed > 0.0f && speed != 1.0f) {
+                Ti = std::max(1, (int) ((float) Ti / speed));
+            }
 
             // Dump intermediate tensors only for chunk 0 so cossim tests
             // compare matching chunks across Python and C++.
@@ -1050,6 +1059,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
                                                      const std::string &   lang,
                                                      const std::string &   instruct,
                                                      int                   T_override,
+                                                     float                 speed,
                                                      float                 chunk_duration_sec,
                                                      float                 chunk_threshold_sec,
                                                      bool                  denoise,
@@ -1137,6 +1147,11 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
     // threshold, otherwise split on punctuation and chain chunks.
     int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T);
 
+    if (T_override <= 0 && speed > 0.0f && speed != 1.0f) {
+        T_total = std::max(1, (int) ((float) T_total / speed));
+        ov_log(OV_LOG_INFO, "[TTS-Stream] Speed %.2f -> T_total scaled to %d frames", speed, T_total);
+    }
+
     int  threshold_frames = (int) (chunk_threshold_sec * (float) frame_rate);
     bool no_chunk         = (T_override > 0) || (chunk_duration_sec <= 0.0f) || (T_total <= threshold_frames);
 
@@ -1193,6 +1208,9 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
             const std::string & this_ref_text = first_no_ref ? std::string() : prompt_text;
 
             int          Ti             = duration_estimate_tokens(ct, this_ref_text, this_T);
+            if (T_override <= 0 && speed > 0.0f && speed != 1.0f) {
+                Ti = std::max(1, (int) ((float) Ti / speed));
+            }
             const char * chunk_dump_dir = (i == 0) ? dump_dir : NULL;
 
             ov_log(OV_LOG_INFO, "[TTS-Stream] Chunk %zu/%zu: chars=%d T=%d ref_T=%d", i + 1, chunks.size(),
@@ -1471,7 +1489,7 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     // into a single audio vector and copies into out.
     if (params->on_chunk) {
         ov_status rc = tts_synthesize_long_stream_internal(
-            pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec,
+            pt, pc, tok, text, lang, instruct, params->T_override, params->speed, params->chunk_duration_sec,
             params->chunk_threshold_sec, params->denoise, mg_cfg, synth_ref_text, synth_ref_tokens, synth_ref_T,
             synth_ref_rms, params->dump_dir, &cc, params->on_chunk, params->on_chunk_user_data);
         if (cc.triggered) {
@@ -1493,10 +1511,10 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
         postproc = params->postproc;
     }
 
-    std::vector<float> audio =
-        tts_synthesize_long_internal(pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec,
-                                     params->chunk_threshold_sec, params->denoise, postproc, mg_cfg, synth_ref_text,
-                                     synth_ref_tokens, synth_ref_T, synth_ref_rms, params->dump_dir, &cc);
+    std::vector<float> audio = tts_synthesize_long_internal(
+        pt, pc, tok, text, lang, instruct, params->T_override, params->speed, params->chunk_duration_sec,
+        params->chunk_threshold_sec, params->denoise, postproc, mg_cfg, synth_ref_text, synth_ref_tokens, synth_ref_T,
+        synth_ref_rms, params->dump_dir, &cc);
 
     if (cc.triggered) {
         ov_set_error("ov_synthesize : cancelled by ov_cancel_cb");

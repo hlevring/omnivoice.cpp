@@ -185,6 +185,7 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->lang                    = nullptr;
     p->instruct                = nullptr;
     p->T_override              = 0;
+    p->speed                   = 1.0f;
     p->chunk_duration_sec      = 15.0f;
     p->chunk_threshold_sec     = 30.0f;
     p->denoise                 = true;
