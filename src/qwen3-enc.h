@@ -121,7 +121,8 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
                                                   int                   S,
                                                   bool                  use_flash_attn = true,
                                                   bool                  clamp_fp16     = false,
-                                                  int                   B              = 1) {
+                                                  int                   B              = 1,
+                                                  int                   layer_idx      = -1) {
     int D   = c.head_dim;
     int Nh  = c.n_heads;
     int Nkv = c.n_kv_heads;
@@ -196,6 +197,19 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
         v = ggml_clamp(ctx, v, -65504.0f, 65504.0f);
     }
 
+    // Unique per-layer names on the attention boundary tensors. ggml auto-names
+    // permute/reshape outputs by suffixing the (empty) source name, so K and V
+    // both become " (permuted)" -> identical OpenVINO output names -> the
+    // intel_gpu "Different primitive with id 'result: (permuted)' exists
+    // already" collision when the OV backend splits the forward into subgraphs.
+    // Names are cosmetic on every other backend (Vulkan ignores them). Avoid the
+    // "_l<digit>" pattern that the OV decoder's extract_layer_from_name() keys on.
+    if (layer_idx >= 0) {
+        ggml_set_name(q, ("ovq" + std::to_string(layer_idx)).c_str());
+        ggml_set_name(k, ("ovk" + std::to_string(layer_idx)).c_str());
+        ggml_set_name(v, ("ovv" + std::to_string(layer_idx)).c_str());
+    }
+
     // 6) Attention (flash or F32 manual fallback)
     float                scale = 1.0f / sqrtf((float) D);
     struct ggml_tensor * attn  = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
@@ -209,6 +223,9 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
         attn = ggml_reshape_2d(ctx, attn, Nh * D, S);
     } else {
         attn = ggml_reshape_3d(ctx, attn, Nh * D, S, B);
+    }
+    if (layer_idx >= 0) {
+        ggml_set_name(attn, ("ovattn" + std::to_string(layer_idx)).c_str());
     }
 
     // 8) O projection
@@ -247,14 +264,15 @@ static struct ggml_tensor * qwen3_build_layer(struct ggml_context *             
                                               bool                                use_flash_attn = true,
                                               bool                                clamp_fp16     = false,
                                               std::vector<struct ggml_tensor *> * sub_outs       = nullptr,
-                                              int                                 B              = 1) {
+                                              int                                 B              = 1,
+                                              int                                 layer_idx      = -1) {
     // Self-attention block
     struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
     if (sub_outs) {
         sub_outs->push_back(norm);
     }
     struct ggml_tensor * attn =
-        qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn, clamp_fp16, B);
+        qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn, clamp_fp16, B, layer_idx);
     if (sub_outs) {
         sub_outs->push_back(attn);
     }
@@ -304,7 +322,7 @@ static struct ggml_tensor * qwen3_build_layers(struct ggml_context *            
     for (int i = 0; i < c.n_layers; i++) {
         std::vector<struct ggml_tensor *> * subs_for_this = (i == dump_sub_layer) ? sub_outs : nullptr;
         hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S, use_flash_attn, clamp_fp16,
-                                   subs_for_this, B);
+                                   subs_for_this, B, i);
         if (intermediate_indices && intermediates) {
             for (int idx : *intermediate_indices) {
                 if (idx == i) {

@@ -218,7 +218,7 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
         gctx, cfg, pt->lm.layers, pt->lm.final_norm, inputs_embeds, t_positions, t_attn, S, pt->use_flash_attn,
         pt->clamp_fp16, dump_hidden_dir && dump_hidden_name ? &dump_layer_indices : nullptr,
         dump_hidden_dir && dump_hidden_name ? &dump_intermediates : nullptr,
-        dump_hidden_dir && dump_hidden_name ? 1 : -1, dump_hidden_dir && dump_hidden_name ? &sub_outs : nullptr);
+        dump_hidden_dir && dump_hidden_name ? 0 : -1, dump_hidden_dir && dump_hidden_name ? &sub_outs : nullptr);
     if (dump_hidden_dir && dump_hidden_name) {
         for (struct ggml_tensor * t : dump_intermediates) {
             ggml_set_output(t);
@@ -300,7 +300,7 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
         }
 
         // Layer 1 sub-module taps: norm1, attn (pre residual), norm2, mlp (pre residual).
-        const char * sub_names[4] = { "-l1-norm1", "-l1-attn", "-l1-norm2", "-l1-mlp" };
+        const char * sub_names[4] = { "-l0-norm1", "-l0-attn", "-l0-norm2", "-l0-mlp" };
         for (size_t i = 0; i < sub_outs.size() && i < 4; i++) {
             dump_tensor_2d(sub_outs[i], std::string(dump_hidden_name) + sub_names[i]);
         }
@@ -526,28 +526,52 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
     // shrinks the GPU->CPU transfer from B_prime * V * K * S floats down to
     // 2 * V * K * T_audio floats, ~5.6x less for the typical voice cloning
     // shape. Math is identical: we just keep less of the same elements.
+    // OpenVINO single-output gate. The two CFG windows are normally emitted as
+    // two graph outputs (cond + uncond). On the intel_gpu plugin each output
+    // gets an auto-inserted, generically-named "permuted" reorder, so two
+    // outputs collide at compile ("Different primitive with id 'result:
+    // (permuted)' exists already"). For OV we concat the two windows into ONE
+    // output on the batch dim; the [V,K,T_audio,2] result is laid out
+    // cond-block then uncond-block, byte-for-byte identical to the two-output
+    // readout, so the CPU consumer is unchanged. Every other backend (the
+    // Vulkan production path) keeps the exact two-output graph below.
+    const bool ov_single_output =
+        (T_audio > 0) && (strncmp(ggml_backend_name(pt->backend), "OPENVINO", 8) == 0);
+
     struct ggml_tensor * cond_audio   = nullptr;
     struct ggml_tensor * uncond_audio = nullptr;
+    struct ggml_tensor * cfg_audio    = nullptr;  // OV-only concat of cond+uncond
     if (T_audio > 0) {
         size_t               cond_offset = (size_t) (S - T_audio) * logits->nb[2] + (size_t) 0 * logits->nb[3];
         struct ggml_tensor * cond_view =
             ggml_view_4d(gctx, logits, V, K, T_audio, 1, logits->nb[1], logits->nb[2], logits->nb[3], cond_offset);
         cond_audio = ggml_cont(gctx, cond_view);
         ggml_set_name(cond_audio, "cond_audio_logits");
-        ggml_set_output(cond_audio);
 
         size_t               uncond_offset = (size_t) 0 * logits->nb[2] + (size_t) 1 * logits->nb[3];
         struct ggml_tensor * uncond_view =
             ggml_view_4d(gctx, logits, V, K, T_audio, 1, logits->nb[1], logits->nb[2], logits->nb[3], uncond_offset);
         uncond_audio = ggml_cont(gctx, uncond_view);
         ggml_set_name(uncond_audio, "uncond_audio_logits");
-        ggml_set_output(uncond_audio);
+
+        if (ov_single_output) {
+            // Concat on the batch dim (dim 3): [V, K, T_audio, 2]. cond is
+            // batch 0 (first V*K*T_audio floats), uncond is batch 1.
+            cfg_audio = ggml_concat(gctx, cond_audio, uncond_audio, 3);
+            ggml_set_name(cfg_audio, "cfg_audio_logits");
+            ggml_set_output(cfg_audio);
+        } else {
+            ggml_set_output(cond_audio);
+            ggml_set_output(uncond_audio);
+        }
     } else {
         ggml_set_output(logits);
     }
 
     struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
-    if (T_audio > 0) {
+    if (ov_single_output) {
+        ggml_build_forward_expand(graph, cfg_audio);
+    } else if (T_audio > 0) {
         ggml_build_forward_expand(graph, cond_audio);
         ggml_build_forward_expand(graph, uncond_audio);
     } else {
@@ -584,8 +608,14 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
     if (T_audio > 0) {
         const size_t per_audio = (size_t) V * (size_t) K * (size_t) T_audio;
         out.resize(2 * per_audio);
-        ggml_backend_tensor_get(cond_audio, out.data(), 0, per_audio * sizeof(float));
-        ggml_backend_tensor_get(uncond_audio, out.data() + per_audio, 0, per_audio * sizeof(float));
+        if (ov_single_output) {
+            // cfg_audio is [V,K,T_audio,2]: cond block then uncond block,
+            // contiguous, matching the two-output [cond | uncond] layout.
+            ggml_backend_tensor_get(cfg_audio, out.data(), 0, 2 * per_audio * sizeof(float));
+        } else {
+            ggml_backend_tensor_get(cond_audio, out.data(), 0, per_audio * sizeof(float));
+            ggml_backend_tensor_get(uncond_audio, out.data() + per_audio, 0, per_audio * sizeof(float));
+        }
     } else {
         const size_t n = ggml_nelements(logits);
         out.resize(n);
