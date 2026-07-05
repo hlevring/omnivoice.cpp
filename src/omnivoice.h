@@ -127,6 +127,14 @@ OV_API struct ov_context * ov_init(const struct ov_init_params * params);
 // Safe on NULL.
 OV_API void ov_free(struct ov_context * ov);
 
+// Force the GGML compute device for subsequent ov_init calls, by device name
+// (e.g. "CPU", "Vulkan0", "CUDA0"; see ggml_backend_dev_name). Overrides the
+// GGML_BACKEND env var; NULL or "" clears it (falls back to env / auto-best).
+// Process-wide, and effective only before the first ov_init (the backend is
+// cached after that). Provided because a DLL loaded at runtime cannot reliably
+// receive backend selection via environment changes.
+OV_API void ov_set_backend(const char * name);
+
 // Cooperative cancellation callback. Returns true to request the
 // synthesis to abort. Polled between chunks of long-form output, so the
 // cancel granularity is roughly chunk_duration_sec.

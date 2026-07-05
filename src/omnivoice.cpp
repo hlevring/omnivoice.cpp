@@ -104,6 +104,10 @@ void ov_log_set(ov_log_cb cb, void * user_data) {
     g_log_cb.store(cb, std::memory_order_release);
 }
 
+void ov_set_backend(const char * name) {
+    g_backend_override = name ? name : "";
+}
+
 // Routes one log line to the installed callback or to stderr. Two-pass
 // vsnprintf sizes the heap buffer when the message exceeds the stack
 // scratchpad, which keeps the common case allocation-free.
