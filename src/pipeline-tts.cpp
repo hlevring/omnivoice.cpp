@@ -1481,7 +1481,10 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
         synth_ref_tokens = params->ref_audio_tokens;
         synth_ref_T      = params->ref_T;
         synth_ref_text   = ref_text;
-        synth_ref_rms    = -1.0f;
+        // Pre-encoded tokens cannot recompute RMS; callers pass it via
+        // ov_tts_params.ref_rms (from ov_voice_ref.ref_rms). ABI < 4
+        // keeps the historical peak/0.5 fallback.
+        synth_ref_rms = (params->abi_version >= 4) ? params->ref_rms : -1.0f;
     }
 
     // Streaming path: on_chunk emits chunks of post processed audio at the

@@ -212,6 +212,7 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->on_chunk                = nullptr;
     p->on_chunk_user_data      = nullptr;
     p->postproc                = true;
+    p->ref_rms                 = -1.0f;
 }
 
 struct ov_context * ov_init(const struct ov_init_params * params) {
@@ -364,6 +365,7 @@ void ov_voice_ref_free(struct ov_voice_ref * ref) {
     ref->ref_codes     = nullptr;
     ref->ref_T         = 0;
     ref->num_codebooks = 0;
+    ref->ref_rms       = -1.0f;
 }
 
 enum ov_status ov_extract_voice_ref(struct ov_context *   ov,
@@ -390,8 +392,9 @@ enum ov_status ov_extract_voice_ref(struct ov_context *   ov,
     try {
         // Match the omnivoice-codec CLI and the --ref-wav synth path:
         // RMS auto-gain, silence trim, then truncation to the hop boundary.
+        // Capture original RMS before gain for loudness-matched post-proc.
         std::vector<float> buf(ref_audio_24k, ref_audio_24k + ref_n_samples);
-        ref_preprocess_audio(buf, 24000, true);
+        const float        ref_rms = ref_preprocess_audio(buf, 24000, true);
 
         const int n_aligned = ((int) buf.size() / ov->pc.hop_length) * ov->pc.hop_length;
         if (n_aligned <= 0) {
@@ -427,9 +430,10 @@ enum ov_status ov_extract_voice_ref(struct ov_context *   ov,
         out->ref_codes     = codes_copy;
         out->ref_T         = (int) (codes.size() / (size_t) K);
         out->num_codebooks = K;
+        out->ref_rms       = ref_rms;
 
-        ov_log(OV_LOG_INFO, "[OmniVoice] Extracted voice ref: K=%d T=%d (%d/%d samples)", out->num_codebooks,
-               out->ref_T, n_aligned, ref_n_samples);
+        ov_log(OV_LOG_INFO, "[OmniVoice] Extracted voice ref: K=%d T=%d ref_rms=%.4f (%d/%d samples)",
+               out->num_codebooks, out->ref_T, out->ref_rms, n_aligned, ref_n_samples);
         return OV_STATUS_OK;
     } catch (const std::bad_alloc &) {
         ov_set_error("ov_extract_voice_ref: out of memory");

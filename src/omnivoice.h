@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 3
+#define OV_ABI_VERSION 4
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -255,15 +255,21 @@ struct ov_tts_params {
     // caller assembling its own timeline onto fixed slots (dubbing) gets a
     // predictable segment length and owns its own edge shaping. Reference
     // loudness matching (ref_rms scaling) is part of voice cloning and runs
-    // either way. Tail field: kept last for ABI growth, read only when
-    // abi_version >= 3. The streaming path always post filters.
+    // either way. Read when abi_version >= 3. The streaming path always
+    // post filters.
     bool postproc;
+
+    // When using pre-encoded ref_audio_tokens: original reference RMS from
+    // ov_extract_voice_ref (before auto-gain). -1 = unset (peak/0.5 fallback).
+    // Inline ref_audio_24k still computes RMS internally. Tail field: read
+    // only when abi_version >= 4.
+    float ref_rms;
 };
 
 // Initialise to the standard defaults. Strings NULL, T_override 0,
 // speed 1.0, chunk_duration_sec 15, chunk_threshold_sec 30, denoise true,
 // preprocess_prompt true, MaskGIT defaults as above, every reference
-// pointer NULL, dump_dir NULL, cancel NULL, postproc true.
+// pointer NULL, dump_dir NULL, cancel NULL, postproc true, ref_rms -1.
 OV_API void ov_tts_default_params(struct ov_tts_params * p);
 
 // Run the full TTS synthesis. Resolves the instruct against the bundled
@@ -294,11 +300,14 @@ OV_API int ov_num_codebooks(const struct ov_context * ov);
 //
 // ref_codes is the RVQ code matrix equivalent to a raw .rvq file, laid
 // out [num_codebooks, ref_T] row-major (T fastest), ready to feed back
-// through ov_tts_params.ref_audio_tokens / ref_T.
+// through ov_tts_params.ref_audio_tokens / ref_T. ref_rms is the original
+// RMS before auto-gain; pass it to ov_tts_params.ref_rms for loudness-
+// matched post-proc on the pre-encoded-token path.
 struct ov_voice_ref {
     int32_t * ref_codes;
     int       ref_T;
     int       num_codebooks;
+    float     ref_rms;
 };
 
 // Extract reusable voice-clone codes from a decoded reference audio
