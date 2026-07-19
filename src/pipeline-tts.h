@@ -156,6 +156,9 @@ void pipeline_tts_llm_batched_ctx_free(PipelineTTS * pt, MaskgitBatchedCtx * ctx
 // instruct must already be resolved against the VoiceDesign vocabulary, see
 // pipeline_tts_resolve_instruct. Used by the --maskgit-test debug path and
 // internally by pipeline_tts_synthesize.
+// Optional progress is forwarded to MaskGIT: progress_base + span * step/num_step.
+typedef void (*tts_progress_fn)(float fraction, void * user_data);
+
 std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const BPETokenizer *  tok,
                                            const std::string &   text,
@@ -168,7 +171,11 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const int32_t *       ref_audio_tokens,
                                            int                   ref_T,
                                            const char *          dump_dir,
-                                           uint32_t *            ctr_lo_inout = nullptr);
+                                           uint32_t *            ctr_lo_inout  = nullptr,
+                                           tts_progress_fn       progress      = nullptr,
+                                           void *                progress_ud   = nullptr,
+                                           float                 progress_base = 0.0f,
+                                           float                 progress_span = 1.0f);
 
 // Validate and normalise the raw instruct string against the voice-design
 // vocabulary. The target language is selected from the synthesis text: any

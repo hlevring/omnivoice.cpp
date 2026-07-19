@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 4
+#define OV_ABI_VERSION 5
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -154,6 +154,11 @@ typedef bool (*ov_cancel_cb)(void * user_data);
 // runs roughly 6 to 12 dB below the buffered path. Logged at INFO when this
 // branch fires.
 typedef bool (*ov_audio_chunk_cb)(const float * samples, int n_samples, void * user_data);
+
+// Cooperative progress callback. fraction is in [0, 1], monotonic non-
+// decreasing within a run. Polled alongside cancel at MaskGIT steps and
+// long-form chunk boundaries. NULL disables. Read when abi_version >= 5.
+typedef void (*ov_progress_cb)(float fraction, void * user_data);
 
 // Log severity. Numerically ordered so a callback can filter with a
 // simple `if (level < threshold) return;`. ERROR is reserved for failure
@@ -264,6 +269,10 @@ struct ov_tts_params {
     // Inline ref_audio_24k still computes RMS internally. Tail field: read
     // only when abi_version >= 4.
     float ref_rms;
+
+    // Progress. NULL disables. Read when abi_version >= 5.
+    ov_progress_cb on_progress;
+    void *         on_progress_user_data;
 };
 
 // Initialise to the standard defaults. Strings NULL, T_override 0,

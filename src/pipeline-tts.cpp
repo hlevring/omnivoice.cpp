@@ -691,7 +691,11 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const int32_t *       ref_audio_tokens,
                                            int                   ref_T,
                                            const char *          dump_dir,
-                                           uint32_t *            ctr_lo_inout) {
+                                           uint32_t *            ctr_lo_inout,
+                                           tts_progress_fn       progress,
+                                           void *                progress_ud,
+                                           float                 progress_base,
+                                           float                 progress_span) {
     if (T <= 0) {
         ov_log(OV_LOG_ERROR, "[TTS] T=%d must be positive", T);
         return {};
@@ -717,7 +721,8 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
     ov_log(OV_LOG_INFO, "[TTS] Prompt: B'=%d K=%d S=%d c_len=%d u_len=%d", prompt.B_prime, prompt.K, prompt.S_max,
            prompt.c_len, prompt.u_len);
 
-    return maskgit_generate(pt, &prompt, mg_cfg, T, dump_dir, ctr_lo_inout);
+    return maskgit_generate(pt, &prompt, mg_cfg, T, dump_dir, ctr_lo_inout, progress, progress_ud, progress_base,
+                            progress_span);
 }
 
 // Cooperative cancel context threaded into the long-form helpers. cb is the
@@ -730,6 +735,9 @@ struct tts_cancel {
     bool (*cb)(void * ud);
     void * ud;
     bool   triggered;
+    // Optional progress (from ov_tts_params.on_progress when abi >= 5).
+    tts_progress_fn progress;
+    void *          progress_ud;
 };
 
 static bool tts_should_cancel(tts_cancel * cc) {
@@ -744,6 +752,19 @@ static bool tts_should_cancel(tts_cancel * cc) {
         return true;
     }
     return false;
+}
+
+static void tts_report_progress(tts_cancel * cc, float fraction) {
+    if (!cc || !cc->progress) {
+        return;
+    }
+    if (fraction < 0.0f) {
+        fraction = 0.0f;
+    }
+    if (fraction > 1.0f) {
+        fraction = 1.0f;
+    }
+    cc->progress(fraction, cc->progress_ud);
 }
 
 // Single-shot synthesis: pipeline_tts_generate followed by
@@ -764,11 +785,16 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
                                                    const int32_t *       ref_audio_tokens,
                                                    int                   ref_T,
                                                    const char *          dump_dir,
-                                                   uint32_t *            ctr_lo_inout) {
+                                                   uint32_t *            ctr_lo_inout,
+                                                   tts_progress_fn       progress      = nullptr,
+                                                   void *                progress_ud   = nullptr,
+                                                   float                 progress_base = 0.0f,
+                                                   float                 progress_span = 1.0f) {
     Timer                t_total;
     Timer                t_gen;
-    std::vector<int32_t> tokens = pipeline_tts_generate(pt, tok, text, lang, instruct, T, denoise, mg_cfg, ref_text,
-                                                        ref_audio_tokens, ref_T, dump_dir, ctr_lo_inout);
+    std::vector<int32_t> tokens =
+        pipeline_tts_generate(pt, tok, text, lang, instruct, T, denoise, mg_cfg, ref_text, ref_audio_tokens, ref_T,
+                              dump_dir, ctr_lo_inout, progress, progress_ud, progress_base, progress_span);
     const double         gen_ms = t_gen.ms();
     if (tokens.empty()) {
         return {};
@@ -878,12 +904,15 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
         ov_log(OV_LOG_INFO, "[TTS-Long] Single-shot path: T=%d frames (%.2fs), threshold=%d frames", T_total,
                (float) T_total / (float) frame_rate, threshold_frames);
 
+        tts_report_progress(cc, 0.0f);
         audio = tts_synthesize_one_chunk(pt, pc, tok, text, lang, instruct, T_total, denoise, mg_cfg, ref_text,
-                                         ext_ref_tokens, ext_ref_T, dump_dir, &shared_ctr_lo);
+                                         ext_ref_tokens, ext_ref_T, dump_dir, &shared_ctr_lo,
+                                         cc ? cc->progress : nullptr, cc ? cc->progress_ud : nullptr, 0.0f, 1.0f);
 
         if (audio.empty()) {
             return audio;
         }
+        tts_report_progress(cc, 1.0f);
     } else {
         // Per-chunk character budget derived from the full-text average
         // tokens-per-character, matching _generate_chunked upstream.
@@ -918,12 +947,17 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
         std::string          prompt_text   = ref_text;
         std::vector<int32_t> chunk0_tokens;
 
+        const float n_chunks_f = (float) chunks.size();
         for (size_t i = 0; i < chunks.size(); i++) {
             if (tts_should_cancel(cc)) {
                 ov_log(OV_LOG_INFO, "[TTS-Long] Cancelled at chunk %zu/%zu", i, chunks.size());
                 return {};
             }
             const std::string & ct = chunks[i];
+            const float         p_base = (float) i / n_chunks_f;
+            const float         p_span = 1.0f / n_chunks_f;
+            tts_progress_fn     p_cb   = cc ? cc->progress : nullptr;
+            void *              p_ud   = cc ? cc->progress_ud : nullptr;
 
             // Chunk 0 in pure auto-voice runs without any reference. Every
             // other case rides on the active prompt.
@@ -949,7 +983,8 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                 // Capture audio tokens before decoding so they can become the
                 // voice prompt for chunks 1..N.
                 chunk0_tokens = pipeline_tts_generate(pt, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text,
-                                                      this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
+                                                      this_ref, this_T, chunk_dump_dir, &shared_ctr_lo, p_cb, p_ud,
+                                                      p_base, p_span);
 
                 if (chunk0_tokens.empty()) {
                     ov_log(OV_LOG_ERROR, "[TTS-Long] chunk 0 generate failed");
@@ -988,9 +1023,9 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                 prompt_T      = Ti;
                 prompt_text   = ct;
             } else {
-                std::vector<float> a =
-                    tts_synthesize_one_chunk(pt, pc, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text,
-                                             this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
+                std::vector<float> a = tts_synthesize_one_chunk(
+                    pt, pc, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text, this_ref, this_T,
+                    chunk_dump_dir, &shared_ctr_lo, p_cb, p_ud, p_base, p_span);
                 if (a.empty()) {
                     ov_log(OV_LOG_ERROR, "[TTS-Long] chunk %zu synthesize failed", i);
                     return {};
@@ -1008,6 +1043,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
         }
 
         ov_log(OV_LOG_INFO, "[TTS-Long] Cross-faded %d chunks -> %zu samples", (int) chunk_audios.size(), audio.size());
+        tts_report_progress(cc, 1.0f);
     }
 
     // Post filtering: remove_silence and fade_and_pad mirror
@@ -1161,14 +1197,17 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
         ov_log(OV_LOG_INFO, "[TTS-Stream] Single-shot path: T=%d frames (%.2fs), threshold=%d frames", T_total,
                (float) T_total / (float) frame_rate, threshold_frames);
 
-        std::vector<float> a = tts_synthesize_one_chunk(pt, pc, tok, text, lang, instruct, T_total, denoise, mg_cfg,
-                                                        ref_text, ext_ref_tokens, ext_ref_T, dump_dir, &shared_ctr_lo);
+        tts_report_progress(cc, 0.0f);
+        std::vector<float> a = tts_synthesize_one_chunk(
+            pt, pc, tok, text, lang, instruct, T_total, denoise, mg_cfg, ref_text, ext_ref_tokens, ext_ref_T, dump_dir,
+            &shared_ctr_lo, cc ? cc->progress : nullptr, cc ? cc->progress_ud : nullptr, 0.0f, 1.0f);
         if (a.empty()) {
             return OV_STATUS_GENERATE_FAILED;
         }
         if (!push_chunk(a)) {
             return aborted ? OV_STATUS_CANCELLED : OV_STATUS_GENERATE_FAILED;
         }
+        tts_report_progress(cc, 1.0f);
     } else {
         int n_chars = chunker_utf8_count(text);
         if (n_chars < 1) {
@@ -1195,12 +1234,17 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
         std::string          prompt_text   = ref_text;
         std::vector<int32_t> chunk0_tokens;
 
+        const float n_chunks_f = (float) chunks.size();
         for (size_t i = 0; i < chunks.size(); i++) {
             if (tts_should_cancel(cc)) {
                 ov_log(OV_LOG_INFO, "[TTS-Stream] Cancelled at chunk %zu/%zu", i, chunks.size());
                 return OV_STATUS_CANCELLED;
             }
-            const std::string & ct = chunks[i];
+            const std::string & ct     = chunks[i];
+            const float         p_base = (float) i / n_chunks_f;
+            const float         p_span = 1.0f / n_chunks_f;
+            tts_progress_fn     p_cb   = cc ? cc->progress : nullptr;
+            void *              p_ud   = cc ? cc->progress_ud : nullptr;
 
             bool                first_no_ref  = (i == 0 && ext_ref_tokens == NULL);
             const int32_t *     this_ref      = first_no_ref ? NULL : prompt_tokens;
@@ -1218,7 +1262,8 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
 
             if (first_no_ref) {
                 chunk0_tokens = pipeline_tts_generate(pt, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text,
-                                                      this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
+                                                      this_ref, this_T, chunk_dump_dir, &shared_ctr_lo, p_cb, p_ud,
+                                                      p_base, p_span);
                 if (chunk0_tokens.empty()) {
                     ov_log(OV_LOG_ERROR, "[TTS-Stream] chunk 0 generate failed");
                     return OV_STATUS_GENERATE_FAILED;
@@ -1253,9 +1298,9 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
                 prompt_T      = Ti;
                 prompt_text   = ct;
             } else {
-                std::vector<float> a =
-                    tts_synthesize_one_chunk(pt, pc, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text,
-                                             this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
+                std::vector<float> a = tts_synthesize_one_chunk(
+                    pt, pc, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text, this_ref, this_T,
+                    chunk_dump_dir, &shared_ctr_lo, p_cb, p_ud, p_base, p_span);
                 if (a.empty()) {
                     ov_log(OV_LOG_ERROR, "[TTS-Stream] chunk %zu synthesize failed", i);
                     return OV_STATUS_GENERATE_FAILED;
@@ -1266,6 +1311,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
                 }
             }
         }
+        tts_report_progress(cc, 1.0f);
     }
 
     // Drain stages in pipeline order.
@@ -1448,10 +1494,16 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     mg_cfg.class_temperature    = params->mg_class_temperature;
     mg_cfg.seed                 = params->mg_seed;
 
-    // Cancel context threaded into the long-form helpers. NULL callback
-    // disables polling; triggered starts at false and flips on the first
-    // poll that returns true.
-    tts_cancel cc = { params->cancel, params->cancel_user_data, false };
+    // Cancel + progress context threaded into the long-form helpers.
+    // Progress fields are only read when abi_version >= 5.
+    tts_cancel cc = {};
+    cc.cb         = params->cancel;
+    cc.ud         = params->cancel_user_data;
+    cc.triggered  = false;
+    if (params->abi_version >= 5) {
+        cc.progress    = params->on_progress;
+        cc.progress_ud = params->on_progress_user_data;
+    }
 
     // Encode the optional raw reference once, before any synthesis. has_raw
     // false leaves the struct empty with ref_rms_for_postproc=-1, routing the

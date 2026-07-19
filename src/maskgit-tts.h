@@ -132,12 +132,20 @@ static void maskgit_gumbel_inplace(float * x, int n, float temperature, int64_t 
 // ctr_lo_inout, when non-NULL, threads the Philox counter across successive
 // MaskGIT calls so a chunked pipeline matches the PyTorch reference (which
 // keeps a single global RNG state across model.generate() boundaries).
+// Optional progress: reports progress_base + progress_span * (step+1)/num_step
+// after each MaskGIT step. NULL cb disables.
+typedef void (*maskgit_progress_fn)(float fraction, void * user_data);
+
 static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                                              PromptTTS *           prompt,
                                              const MaskgitConfig & cfg,
                                              int                   T,
-                                             const char *          dump_dir     = nullptr,
-                                             uint32_t *            ctr_lo_inout = nullptr) {
+                                             const char *          dump_dir      = nullptr,
+                                             uint32_t *            ctr_lo_inout  = nullptr,
+                                             maskgit_progress_fn   progress      = nullptr,
+                                             void *                progress_ud   = nullptr,
+                                             float                 progress_base = 0.0f,
+                                             float                 progress_span = 1.0f) {
     const int K       = prompt->K;
     const int B_prime = prompt->B_prime;
     const int S       = prompt->S_max;
@@ -176,6 +184,18 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                                       S);
 
     for (int step = 0; step < cfg.num_step; step++) {
+        if (progress && cfg.num_step > 0) {
+            float local = (float) (step + 1) / (float) cfg.num_step;
+            float frac  = progress_base + progress_span * local;
+            if (frac < 0.0f) {
+                frac = 0.0f;
+            }
+            if (frac > 1.0f) {
+                frac = 1.0f;
+            }
+            progress(frac, progress_ud);
+        }
+
         int k_demask = sched[step];
         if (k_demask <= 0) {
             continue;
