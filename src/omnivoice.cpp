@@ -244,7 +244,7 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
     // reader, the audio tokenizer load or the LM weight load throws via
     // ov_throw; the catch funnels every variant into one cleanup via
     // ov_free, which is idempotent on partial state (NULL-safe sched, NULL
-    // GGUF handles, refcount-correct backend release).
+    // GGUF handles, NULL-safe backend_release).
     try {
         ov->bp = backend_init("LM");
         if (!ov->bp.backend) {
